@@ -1,0 +1,28 @@
+services:
+  tensorflow:
+    #image: nvcr.io/nvidia/tensorflow:22.12-tf2-py3
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tf-notebook
+    tty: true
+    ports: 
+      - 8888:8888
+      - 6006:6006
+      - 5000:5000
+    volumes:
+      - ${VOLUME_PATH}:/workspace/bug_project
+    ipc: "host"
+    shm_size: 30gb
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+    env_file:
+      - .env
+    command: jupyter notebook
