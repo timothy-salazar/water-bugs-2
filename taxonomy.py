@@ -5,6 +5,7 @@ import os
 import time
 import pandas as pd
 import re
+import json
 
 # this will raise an error if you don't have these environment variables set.
 EMAIL=os.environ['NCBI_EMAIL_ADDR']
@@ -13,12 +14,189 @@ DATA_PATH=os.environ['NCBI_DATA_PATH']
 SLEEP_INTERVAL=.5
 RETURN_RANKS=['species','genus','family','order']
 
-def thing(d):
-    s = re.sub('_sp|_adult|_larva', '', d).split('_')
-    if len(s) > 1:
-        return '+'.join([s[0], s[-1]])
+def make_req(
+        url: str,
+        payload: dict,
+        max_attempts: int=3,
+        timeout: int=10):
+    """ Input:
+            url: str - the url we want to make the request to
+            payload: dict - contains the values we want to pass as parameters 
+                in the URL's query string
+            max_attempts: int - the number of retries to make before giving up
+            timeout: int - the length of time in seconds to wait before assuming
+                something went wrong with the request
+        Output:
+            req: requests.Response - the response returned by the NCBI API
+    """
+    for i in range(max_attempts + 1):
+        try:
+            req = requests.get(
+                url,
+                params=payload,
+                timeout=timeout)
+            status_code = req.status_code
+            req.raise_for_status()
+            return req
+        except requests.HTTPError as e:
+            if i == max_attempts:
+                raise e
+            print('connection issue. Waiting 1 second and trying again...')
+            time.sleep(1)
+    raise requests.HTTPError
+    
+    
+def esearch_req(species: str):
+    """ Input:
+            species: str - the name of the species whose ID we want.
+        Output:
+            req: requests.Response - the response returned by the esearch
+                endpoint of the NCBI API for the species in question.
+    """
+    url = BASE_URL + 'esearch.fcgi'
+    payload = {
+            'mail': EMAIL,
+            'tool': TOOL, 
+            'db':'taxonomy', 
+            'term':species,
+            'rettype':'uilist',
+            'retmode':'json'
+        }
+    req = make_req(url, payload)
+    return req
+
+def efetch_req(taxid: int):
+    """ Input:
+            taxid: int - the taxon ID that we want more information on
+        Output:
+            req: requests.Response - the response returned by the efetch
+                endpoint of the NCBI API for the taxon in question.
+    """
+    url = BASE_URL + 'efetch.fcgi'
+    payload = {
+        'mail': EMAIL,
+        'tool': TOOL, 
+        'db':'taxonomy', 
+        'id':taxid}
+    req = make_req(url, payload)
+    return req
+    
+
+def species_to_id(species:str, verbose=False):
+    """ Input:
+            species: str - the name of the species whose ID we want.
+            verbose: bool - if true, it will print each species name as it is started
+        Output:
+            int - the taxon id for the given species
+    """
+    if verbose:
+        print('Starting species:', species)
+    req = esearch_req(species)
+    id_list = req.json()['esearchresult']['idlist']
+    if len(id_list) > 1:
+        raise ValueError(f'Expected API to return one id, but it returned {len(id_list)} ids instead')
+    if not id_list:
+        raise ValueError(f'Request returned empty id_list: {req.text}')
+    if not id_list[0].isdigit():
+        raise ValueError(f'Expected API to return one taxon id consisting of all decimal \
+        characters. Returned {id_list[0]} instead.')
+    return int(id_list[0])
+
+def etree_from_id(taxid: int):
+    """ Input:
+            taxid: int - an NCBI taxonomic id. 
+        Output:
+            tree: defusedxml.ElementTree - an element tree containing the information returned by the
+                NCBI efetch API on the lineage of the organism.
+    """
+    req = efetch_req(taxid)
+    tree = ET.fromstring(req.content)
+    return tree
+
+def etree_to_dict(root: ET):
+    """ Input:
+            root: defusedxml.ElementTree - an xml document as returned by the NCBI API efetch endpoint.
+        Output:
+            taxon_info: dict - the keys are:
+                - rank: the rank of the organism, i.e. "order", "phylum", etc.
+                - sci_name: the scientific name of the organism
+                - taxon_id: the taxonomic id (an int)
+                - lineage: a list of dicts. The keys are:
+                    - rank:
+                    - sci_name: 
+                    - taxon_id: 
+    Note: Within taxon_info we have the lineage dictionary, which is a list of dicts. 
+    We're using a list of dicts because some ranks (specifically "clade") can appear multiple
+    times.
+    I decided to preserve all of the lineage data at this stage and filter out unused entries
+    further down the line, so it will be easy to rework - just in case I find a use for the extra
+    data somewhere.
+    """
+    # This gets us the rank, scientific name, and taxon id for the organism
+    root_taxon = root.find('Taxon')
+    rank, taxon_info = parse_taxon_element(root_taxon)
+    taxon_info['rank'] = rank
+    
+    # This gets a list of the taxa in the organism's lineage and then creates
+    # a dictionary of lists, where each entry is a dict containing scientific
+    # name and taxonomic id
+    lineage = defaultdict(list)
+    taxa = root_taxon.find('LineageEx').findall('Taxon')
+    for taxon in taxa:
+        rank, info = parse_taxon_element(taxon)
+        lineage[rank].append(info)
+        
+    taxon_info['lineage'] = lineage
+    return taxon_info
+
+def parse_taxon_element(taxon: Element):
+    ''' Input:
+            taxon: Element - the 'Taxon' element from the element tree which 
+                we retrieved from the NCBI API
+        Output:
+            (rank, info): a tuple. "rank" is the rank of the element (i.e. "order", 
+                "phylum", etc.), and "info" is a dictionary containing the 
+                scientific name and taxon id for that rank.
+    '''
+    rank = taxon.find('Rank').text
+    info = {
+        'sci_name': taxon.find('ScientificName').text,
+        'taxon_id': int(taxon.find('TaxId').text)
+    }
+    return rank, info
+
+def species_to_dict(species, verbose=False):
+    ''' Input:
+            species: str - the species we're interested in
+        Output:
+            tax_dict: dict - a dictionary containing the taxonomy data about
+                "species" which was returned by the NCBI API
+    '''
+    taxid = species_to_id(species, verbose)
+    tree = etree_from_id(taxid)
+    tax_dict = etree_to_dict(tree)
+    return tax_dict
+
+def preprocess_name(dir_name):
+    """ Input:
+            dir_name: str - the name of a directory. This name should correspond
+                to the name of an organism. i.e. 'Asellus_aquaticus', 'Chelifera', 
+                'Ephemerella_aroni_aurivillii', etc.
+        Output:
+            str - the name of the organism, processed to obviate the issues I ran
+                into with the single dataset I'm working with right now:
+                    - organism names that end with "_sp", "_adult", or "_larva"
+                    - organism names that contain more than 2 parts (this may be due
+                      to ambiguity - I might reexamine this later)
+    
+    This isn't perfect, nor is it magic. 
+    If there are misspelled names you'll have to go in and change them.
+    """
+    parts = re.sub('_sp|_adult|_larva', '', dir_name).split('_')
+    if len(parts) > 1:
+        return '+'.join([parts[0], parts[-1]])
     else:
-        return s[0]
+        return parts[0]
 
 def get_names_from_dataset(path:str):
     """ Input:
@@ -30,231 +208,43 @@ def get_names_from_dataset(path:str):
                 in the dataset. These will be of the form "Genus+species"
     """
     p = Path(path)
-    species_list = [thing(x.name) for x in p.iterdir() if x.is_dir()]
-    return species_list
+    species_list = [preprocess_name(x.name) for x in p.iterdir() if x.is_dir()]
+    return species_list  
 
-def get_id_from_name(species:str):
-    """ Input:
-            species: str - the name of the species whose ID we want. Should
-                be formatted as "Genus+species"
-        Output:
-            id_list: list of strings - a list containing the ids returned by
-                the search.
-    """
-    print('Starting species:', species)
-    url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi'
-    payload = {
-            'mail': EMAIL,
-            'tool': TOOL, 
-            'db':'taxonomy', 
-            'term':species,
-            'rettype':'uilist',
-            'retmode':'json'
-        }
-    req = requests.get(url, params=payload)
-    req.raise_for_status()
-    id_list = req.json()['esearchresult']['idlist']
-    if len(id_list) > 1:
-        raise ValueError(f'Expected API to return one id, but it returned {len(id_list)} ids instead')
-    if not id_list:
-        raise ValueError(f'Request returned empty id_list: {req.text}')
-    return id_list[0]
-
-def get_id_from_dir(species:str):
-    """ Input:
-            species: str - the name of the species whose ID we want. Should
-                be formatted as "Genus+species"
-        Output:
-            id_list: list of strings - a list containing the ids returned by
-                the search.
-    """
-    species = thing(species)
-    print('Starting species:', species)
-    url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi'
-    payload = {
-            'mail': EMAIL,
-            'tool': TOOL, 
-            'db':'taxonomy', 
-            'term':species,
-            'rettype':'uilist',
-            'retmode':'json'
-        }
-    req = requests.get(url, params=payload)
-    req.raise_for_status()
-    id_list = req.json()['esearchresult']['idlist']
-    if len(id_list) > 1:
-        raise ValueError(f'Expected API to return one id, but it returned {len(id_list)} ids instead')
-    if not id_list:
-        raise ValueError(f'Request returned empty id_list: {req.text}')
-    return id_list[0]
-
-def get_taxon_dict(
-        taxid:str, 
-        filter_list:list=None, 
-        human_readable:bool=True,
-        prefix:str=''
-    ):
-    """ Input:
-            taxid: str - the id of the species we want to get taxonomic info
-                about
-            filter_list: list of strings - contains the names of the ranks
-                we want to return. For example: if filter_list = ['genus'],
-                this function will return a dictionary that only includes an
-                entry for genus.
-                If an item in filter_list is not returned by the API, an entry
-                will not be created. In the example above, if no 'genus' entry
-                is returned by the API this function will return an empty dict.
-        Output:
-            taxonomy_dict: dict - contains taxonomic information about the
-                species indicated by 'taxid' (kingdom, phylum, class, etc.)
-    """
-    taxonomy_dict = dict()
-    url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
-    payload = {
-        'mail': EMAIL,
-        'tool': TOOL, 
-        'db':'taxonomy', 
-        'id':taxid}
-    r = requests.get(url, params=payload)
-    root = ET.fromstring(r.content)
-    taxonomy_dict = stuff(root[0], taxonomy_dict, human_readable=human_readable, prefix=prefix)
-
-    # Get every other taxon in the species' lineage
-    lineage = root[0].find('LineageEx')
-    taxon = lineage.findall('Taxon')
-    # get_rank = lambda taxa: taxa.find('Rank').text
-    # get_name = lambda taxa: taxa.find('ScientificName').text
-    # taxonomy_dict = {get_rank(taxa):get_name(taxa) for taxa in taxon}
-
-    # NOTE: there are multiple entries with the rank "clade". Because this
-    # makes a dict, only one of these will be present in taxonomy_dict (if clade
-    # is included in 'filter_list' - it's a moot point otherwise since the clade
-    # entries will be dropped)
+def filter_dict(d):
+    {k:v for x,k,v in enumerate(d.items()) if k in RETURN_RANKS or x==0}
     
-    for taxa in taxon:
-        taxonomy_dict = stuff(taxa, taxonomy_dict, filter_list, human_readable, prefix=prefix)
-        # rank = taxa.find('Rank').text
-        # if filter_list and rank in filter_list:
-        #     if human_readable:
-        #         taxonomy_dict[rank] = taxa.find('ScientificName').text
-        #     else:
-        #         taxonomy_dict[rank] = taxa.find('TaxId').text
-    return taxonomy_dict
-
-def stuff(
-        taxa, 
-        taxonomy_dict, 
-        filter_list:list=None, 
-        human_readable:bool=True,
-        prefix:str=''
-        ):
-    """
-    """
-    rank = taxa.find('Rank').text
-    if human_readable:
-        name = taxa.find('ScientificName').text
+def get_taxon_data(json_path):
+    p = Path(json_path)
+    if p.exists():
+        with p.open() as f:
+            taxon_data = json.load(f)
     else:
-        name = taxa.find('TaxId').text
-    # We only filter if filter list is not none
-    if filter_list and rank in filter_list:
-        taxonomy_dict[prefix+rank] = name
-    if not filter_list:
-         taxonomy_dict[prefix+rank] = name 
-    return taxonomy_dict
-        
-
-# def taxonomy_from_name(species:str, filter_list:list=None, human_readable=True):
-#     taxon_id = get_id_from_name(species)
-#     time.sleep(SLEEP_INTERVAL)
-#     tax_dict = get_taxon_dict(taxon_id)
-#     time.sleep(SLEEP_INTERVAL)
-#     return tax_dict
-
-# def get_df(human_readable=True):
-#     species_list = get_names_from_dataset(DATA_PATH)
-#     taxonomy_list = []
-#     for species in species_list:
-#         taxon_id = get_id_from_name(species)
-#         time.sleep(SLEEP_INTERVAL)
-#         tax_dict = get_taxon_dict(taxon_id, filter_list=RETURN_RANKS, human_readable=human_readable)
-#         time.sleep(SLEEP_INTERVAL)
-#         # if human_readable:
-#         #     tax_dict['species'] = species
-#         # else:
-#         #     tax_dict['species'] = taxon_id
-#         # tax_dict['species'] = species
-#         # tax_dict['taxid'] = taxon_id
-#         taxonomy_list.append(tax_dict)
-#     return pd.DataFrame.from_records(taxonomy_list)
-
-def name_to_tax(species, human_readable=True):
-    taxon_id = get_id_from_name(thing(species))
-    time.sleep(SLEEP_INTERVAL)
-    tax_dict = get_taxon_dict(
-                taxon_id, 
-                filter_list=RETURN_RANKS, 
-                human_readable=human_readable,
-            )
-    time.sleep(SLEEP_INTERVAL)
-    return tax_dict
+        taxon_data = dict()
     
-def n2req(species):
-    taxon_id = get_id_from_name(thing(species))
-    time.sleep(SLEEP_INTERVAL)
-    url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
-    payload = {
-        'mail': EMAIL,
-        'tool': TOOL, 
-        'db':'taxonomy', 
-        'id':taxon_id}
-    r = requests.get(url, params=payload)
-    return r
-
-def n2tree(species):
-    r = n2req(species)
-    root = ET.fromstring(r.content)
-    sdfa(root[0])
-    lineage = root[0].find('LineageEx')
-    taxon = lineage.findall('Taxon')
-    for taxa in taxon:
-        sdfa(taxa)
-
-def sdfa(taxa):
-    rank = taxa.find('Rank').text
-    name = taxa.find('ScientificName').text
-    print(rank.ljust(20), ':', name)
-
-def junk():
-    labels = []
-    taxonomy_list = []
-    species_list = []
-    for directory in os.walk(DATA_PATH):
-        path, dirs, files = directory
-        if files:
-            dir_name = os.path.split(path)[-1]
-            species = thing(dir_name)
-            taxon_id = get_id_from_name(species)
-            species_list.append(species)
-            time.sleep(SLEEP_INTERVAL)
-            tax_dict_hr = get_taxon_dict(
-                    taxon_id, 
-                    filter_list=RETURN_RANKS, 
-                    human_readable=True,
-                    prefix='hr_'
-                )
-            tax_dict = get_taxon_dict(
-                    taxon_id, 
-                    filter_list=RETURN_RANKS, 
-                    human_readable=False
-                )
-            # tax_dict = {k:int(v) for k,v in tax_dict.items()}
-            labels += [[int(v) for v in tax_dict.values()]] * len(files)
-            tax_dict['path'] = path
-            tax_dict['dir_name'] = dir_name
-            tax_dict['taxon_id'] = int(taxon_id)
-            tax_dict |= tax_dict_hr
-            taxonomy_list.append(tax_dict)
-            time.sleep(SLEEP_INTERVAL)
+    organism_names = set(get_names_from_dataset(DATA_PATH))
+    new_organisms = organism_names.difference(taxon_data.keys())
+    failed_to_retrieve = list()
+    print(f'Found {len(organism_names)} organism:')
+    print(f'\t- {len(organism_names)-len(new_organisms)} organisms already saved to json')
+    print(f'\t- {len(new_organisms)} new organisms to retrieve data for\n')
+    
+    progress_bar = tqdm(new_organisms)
+    for organism_name in progress_bar:
+        progress_bar.set_description(desc=organism_name)
+        try:
+            taxon_dict = species_to_dict(organism_name)
+            taxon_data[organism_name] = taxon_dict
+        except:
+            print(f'Failed to retrieve data for organism "{organism_name}"')
+            failed_to_retrieve.append(organism_name)
+    with open(json_path, 'w+') as f:
+        json.dump(taxon_data, f)
+    print(f'\nData for {len(new_organisms) - len(failed_to_retrieve)} organisms \
+    successfully retrieved')
+    print(f'Failed to retrieve {len(failed_to_retrieve)} organisms:')
+    print(failed_to_retrieve)
+    return taxon_data
             
 
 
