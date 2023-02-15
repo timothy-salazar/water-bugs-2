@@ -1,18 +1,24 @@
 from pathlib import Path
 import requests
-import xml.etree.ElementTree as ET
+# because xml is dangerous
+from defusedxml import ElementTree as ET
+from xml.etree.ElementTree import Element
+from collections import defaultdict
 import os
 import time
 import pandas as pd
 import re
 import json
+from tqdm import tqdm
 
 # this will raise an error if you don't have these environment variables set.
 EMAIL=os.environ['NCBI_EMAIL_ADDR']
 TOOL=os.environ['NCBI_TOOL_NAME']
 DATA_PATH=os.environ['NCBI_DATA_PATH']
 SLEEP_INTERVAL=.5
-RETURN_RANKS=['species','genus','family','order']
+RETURN_RANKS=['order','family','genus','species']
+BASE_URL='https://eutils.ncbi.nlm.nih.gov/entrez/eutils/'
+JSON_PATH=os.environ['JSON_PATH']
 
 def make_req(
         url: str,
@@ -245,9 +251,6 @@ def get_taxon_data(json_path):
     print(f'Failed to retrieve {len(failed_to_retrieve)} organisms:')
     print(failed_to_retrieve)
     return taxon_data
-            
-
-
 
 if __name__ == '__main__':
     pass
