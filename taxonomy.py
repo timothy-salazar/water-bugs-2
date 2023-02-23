@@ -41,7 +41,6 @@ def make_req(
                 url,
                 params=payload,
                 timeout=timeout)
-            status_code = req.status_code
             req.raise_for_status()
             return req
         except requests.HTTPError as e:
@@ -58,6 +57,11 @@ def esearch_req(species: str):
         Output:
             req: requests.Response - the response returned by the esearch
                 endpoint of the NCBI API for the species in question.
+
+    The NCBI eutils esearch endpoint can return a list of UIDs that match a
+    query.
+    Docs are here:
+    https://www.ncbi.nlm.nih.gov/books/NBK25499/#chapter4.ESearch
     """
     url = BASE_URL + 'esearch.fcgi'
     payload = {
@@ -77,6 +81,11 @@ def efetch_req(taxid: int):
         Output:
             req: requests.Response - the response returned by the efetch
                 endpoint of the NCBI API for the taxon in question.
+    
+    The NCBI eutils efetch endpoint returns data records for a UID or list of
+    UIDs.
+    Docs are here:
+    https://www.ncbi.nlm.nih.gov/books/NBK25499/#chapter4.EFetch
     """
     url = BASE_URL + 'efetch.fcgi'
     payload = {
@@ -88,7 +97,7 @@ def efetch_req(taxid: int):
     return req
     
 
-def species_to_id(species:str, verbose=False):
+def species_to_id(species: str, verbose: bool=False):
     """ Input:
             species: str - the name of the species whose ID we want.
             verbose: bool - if true, it will print each species name as it is started
@@ -171,7 +180,7 @@ def parse_taxon_element(taxon: Element):
     }
     return rank, info
 
-def species_to_dict(species, verbose=False):
+def species_to_dict(species, verbose: bool=False):
     ''' Input:
             species: str - the species we're interested in
         Output:
@@ -183,7 +192,7 @@ def species_to_dict(species, verbose=False):
     tax_dict = etree_to_dict(tree)
     return tax_dict
 
-def preprocess_name(dir_name):
+def preprocess_name(dir_name: str):
     """ Input:
             dir_name: str - the name of a directory. This name should correspond
                 to the name of an organism. i.e. 'Asellus_aquaticus', 'Chelifera', 
@@ -204,23 +213,37 @@ def preprocess_name(dir_name):
     else:
         return parts[0]
 
-def get_names_from_dataset(path:str):
+def get_names_from_dataset(path: str):
     """ Input:
             path: str - the path to the directory containing the dataset.
                 This assumes that the images are stored in directories whose
                 names are formatted as "Genus_species".
         Output:
-            species_list: list of strings - the names of the species represented
-                in the dataset. These will be of the form "Genus+species"
+            species_list: list of strings - the names of the directories.
     """
     p = Path(path)
-    species_list = [preprocess_name(x.name) for x in p.iterdir() if x.is_dir()]
-    return species_list  
-
-def filter_dict(d):
-    {k:v for x,k,v in enumerate(d.items()) if k in RETURN_RANKS or x==0}
+    species_list = [x.name for x in p.iterdir() if x.is_dir()]
+    return species_list
     
-def get_taxon_data(json_path):
+def get_taxon_data(json_path: str):
+    """ Input:
+            json_path: str - the path of the json file in which we want to store
+                our taxon data. If the file doesn't exist it will be created.
+            typo_path: str - the path to a json file containing a dictionary
+                that maps the names of directories that have been misspelled to
+                corrected versions.
+                I'm doing this as a dictionary in a separate json file instead
+                of the simpler option of just changing the name of the directory
+                manually because I might need to wipe the data - this happened 
+                once when an image got corrupted by Tensorflow and it was easier
+                to just wipe the directory and unzip it again.
+                It's not just a dict at the top of the other json doc for
+                similar reasons.
+        Output:
+            taxon_data: dict - a dictionary in which the keys are the names of
+                directories, and the values are dictionaries containing the
+                taxonomic lineage information returned by the API.
+    """
     p = Path(json_path)
     if p.exists():
         with p.open() as f:
@@ -228,29 +251,59 @@ def get_taxon_data(json_path):
     else:
         taxon_data = dict()
     
-    organism_names = set(get_names_from_dataset(DATA_PATH))
-    new_organisms = organism_names.difference(taxon_data.keys())
+    directory_names = set(get_names_from_dataset(DATA_PATH))
+    new_directories = directory_names.difference(taxon_data.keys())
     failed_to_retrieve = list()
-    print(f'Found {len(organism_names)} organism:')
-    print(f'\t- {len(organism_names)-len(new_organisms)} organisms already saved to json')
-    print(f'\t- {len(new_organisms)} new organisms to retrieve data for\n')
+    print(f'Found {len(directory_names)} directories:')
+    print(f'\t- {len(directory_names)-len(new_directories)} directories already\
+         saved to json')
+    print(f'\t- {len(new_directories)} new directories to retrieve data for\n')
     
-    progress_bar = tqdm(new_organisms)
-    for organism_name in progress_bar:
-        progress_bar.set_description(desc=organism_name)
+    progress_bar = tqdm(new_directories)
+    for dir_name in progress_bar:
+        progress_bar.set_description(desc=dir_name.rjust(20, '-')[:20])
         try:
+            # We want a dictionary where the keys are the names of directories,
+            # so we only clean up the directory name with preprocess_name() and
+            # get "organism_name" to make the API call
+            organism_name = preprocess_name(dir_name)
             taxon_dict = species_to_dict(organism_name)
-            taxon_data[organism_name] = taxon_dict
-        except:
-            print(f'Failed to retrieve data for organism "{organism_name}"')
-            failed_to_retrieve.append(organism_name)
-    with open(json_path, 'w+') as f:
+            taxon_data[dir_name] = taxon_dict
+        except ValueError:
+            print(f'Failed to retrieve data for directory "{dir_name}"')
+            failed_to_retrieve.append(dir_name)
+
+    # Save data back to the 
+    with open(json_path, 'w') as f:
         json.dump(taxon_data, f)
-    print(f'\nData for {len(new_organisms) - len(failed_to_retrieve)} organisms \
-    successfully retrieved')
-    print(f'Failed to retrieve {len(failed_to_retrieve)} organisms:')
+    print(f'\nData for {len(new_directories) - len(failed_to_retrieve)} \
+        directories successfully retrieved')
+    print(f'Failed to retrieve {len(failed_to_retrieve)} directories:')
     print(failed_to_retrieve)
     return taxon_data
 
+def dict_from_path(file_path: str):
+    """ Input:
+            file_path: str - the path to a file containing json data. 
+        Output:
+            a dictionary containing the data in the file specified by 
+            "file_path". If the file does not exist, an empty dictionary is
+            returned instead.
+    """
+    path = Path(file_path)
+    if path.exists():
+        with path.open() as f:
+            return json.load(f)
+    else:
+        return dict()
+
+def handle_typo(original, corrected, json_path):
+    organism_name = preprocess_name(corrected)
+    taxon_dict = species_to_dict(organism_name)
+    taxon_data = dict_from_path(json_path)
+    taxon_data[original] = taxon_dict
+    with open(json_path, 'w') as f:
+        json.dump(taxon_data, f)
+
 if __name__ == '__main__':
-    pass
+    get_taxon_data(JSON_PATH)

@@ -13,14 +13,17 @@ CONTAINER_NAME=tf-notebook
 SLEEP_INTERVAL=1
 RETRY_COUNT=4
 
-# check to see that the PERSISTENT_STORAGE_PATH environment variable
-# has been set
-if [ -n "$PERSISTENT_STORAGE_PATH" ]; then
-  echo "Will attempt to mount drive $PERSISTENT_STORAGE_PATH as persistent storage"
+# checks that the PERSISTENT_STORAGE_UUID environment variable has been set
+#    - You can find the UUID using the disks utility, or by running:
+#        lsblk -f | grep -v loop
+if [ -n "$PERSISTENT_STORAGE_UUID" ]; then
+  echo "Will attempt to mount drive $PERSISTENT_STORAGE_UUID as persistent storage"
 else
-  echo "The PERSISTENT_STORAGE_PATH environment variable has not been set. Exiting."
+  echo "The PERSISTENT_STORAGE_UUID environment variable has not been set. Exiting."
   exit 1
 fi
+
+PERSISTENT_STORAGE_PATH="/dev/disk/by-uuid/$PERSISTENT_STORAGE_UUID"
 
 # Mounts a drive containing a directory that I want to be accessible to the container
 mount_persistent_storage() {
