@@ -10,6 +10,7 @@ services:
       - 8888:8888
       - 6006:6006
       - 5000:5000
+      - 8080:8080
     volumes:
       - ${VOLUME_PATH}:/workspace/bug_project
     ipc: "host"
@@ -25,4 +26,4 @@ services:
               capabilities: ["gpu"]
     env_file:
       - .env
-    command: jupyter notebook
+    command: jupyter notebook --no-browser --port=8080

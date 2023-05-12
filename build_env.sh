@@ -56,6 +56,6 @@ wait_for_notebook() {
 mount_persistent_storage
 docker compose build
 docker compose up -d
-wait_for_notebook
-URL='http://localhost:8888/?token='$TOKEN
-python3 -m webbrowser $URL
+# wait_for_notebook
+# URL='http://localhost:8888/?token='$TOKEN
+# python3 -m webbrowser $URL
